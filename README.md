@@ -16,24 +16,11 @@ A Model Context Protocol (MCP) server that provides integration with the [Givebu
 
 ## Installation
 
-### Using npx (Recommended)
-
-You can run the server directly without installation:
-
 ```bash
-npx givebutter-mcp
-```
-
-### Global Installation
-
-```bash
-npm install -g givebutter-mcp
-```
-
-### Local Installation
-
-```bash
-npm install givebutter-mcp
+git clone https://github.com/johnnylinsf/givebutter-mcp.git
+cd givebutter-mcp
+npm install
+npm run build
 ```
 
 ## Configuration
@@ -55,8 +42,8 @@ Add the following to your Claude Desktop configuration file:
 {
   "mcpServers": {
     "givebutter": {
-      "command": "npx",
-      "args": ["-y", "givebutter-mcp"],
+      "command": "node",
+      "args": ["/path/to/givebutter-mcp/dist/index.js"],
       "env": {
         "GIVEBUTTER_API_KEY": "your-api-key-here"
       }
@@ -67,16 +54,8 @@ Add the following to your Claude Desktop configuration file:
 
 ### Configure with Claude Code
 
-Add the MCP server using the Claude CLI:
-
 ```bash
-claude mcp add givebutter -- npx -y givebutter-mcp
-```
-
-Then set your API key in the environment or `.env` file:
-
-```bash
-export GIVEBUTTER_API_KEY=your-api-key-here
+claude mcp add givebutter -e GIVEBUTTER_API_KEY=your-api-key -- node /path/to/givebutter-mcp/dist/index.js
 ```
 
 ## Available Tools
@@ -162,29 +141,6 @@ Once configured, you can ask Claude questions like:
 - "What's the total raised for campaign ID 12345?"
 - "Create a new campaign called 'Spring Fundraiser' with a goal of $10,000"
 - "Show me the transaction details for donation #67890"
-
-## Development
-
-### Building from Source
-
-```bash
-git clone https://github.com/johnnylinsf/givebutter-mcp.git
-cd givebutter-mcp
-npm install
-npm run build
-```
-
-### Running Locally
-
-```bash
-GIVEBUTTER_API_KEY=your-api-key npm start
-```
-
-### Development Mode
-
-```bash
-npm run dev
-```
 
 ## API Documentation
 
