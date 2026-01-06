@@ -146,10 +146,6 @@ Once configured, you can ask Claude questions like:
 
 For more information about the Givebutter API, see the [official API documentation](https://docs.givebutter.com).
 
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
