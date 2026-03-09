@@ -14,7 +14,8 @@
     "url": "git+https://github.com/johnnylinsf/givebutter-mcp.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
