@@ -62,12 +62,13 @@ async function apiRequest(
     throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
   }
 
-  // Handle 204 No Content
-  if (response.status === 204) {
+  // Some endpoints (notably DELETE /campaigns/{id}) return 200 with an
+  // empty body rather than 204, so trust the body length, not the status.
+  const text = await response.text();
+  if (text.length === 0) {
     return { success: true };
   }
-
-  return response.json();
+  return JSON.parse(text);
 }
 
 // Helper to build a body from optional fields
@@ -93,11 +94,12 @@ server.tool(
   "list_campaigns",
   "List all campaigns associated with your Givebutter account",
   {
-    page: z.number().optional().describe("Page number for pagination"),
+    page: z.number().optional().describe("Page number (1-indexed)"),
+    per_page: z.number().int().min(1).max(100).optional().describe("Items per page (default 20, max 100)"),
     scope: z.enum(["owned", "beneficiary", "chapter"]).optional().describe("Filter by campaign scope"),
   },
-  async ({ page, scope }) => {
-    const result = await apiRequest("/campaigns", "GET", undefined, { page, scope });
+  async ({ page, per_page, scope }) => {
+    const result = await apiRequest("/campaigns", "GET", undefined, { page, per_page, scope });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -114,22 +116,40 @@ server.tool(
   }
 );
 
+// Source: docs.givebutter.com/api-reference/campaigns/create-a-campaign (verified 2026-04-30)
+const campaignSettingsSchema = z.array(z.object({
+  name: z.string().describe("Setting key (e.g., 'theme_color', 'default_frequency', 'custom_donation_amounts')"),
+  value: z.any().describe("Setting value — type depends on the setting (string, boolean, object, or array)"),
+}).strict()).optional().describe("Campaign settings as {name, value} pairs. The OpenAPI spec lists this as string[] but the live API rejects strings with 'settings.0.name field is required'.");
+
+const campaignTypeDescription = `Campaign type. Maps to the Givebutter dashboard creation options as follows:
+
+- 'collect' → 'Fundraising Page' in the dashboard. Standalone donation page with goal, donation tiers, and updates feed. Most common type.
+- 'fundraise' → 'Peer-to-Peer Fundraiser' in the dashboard. Like 'collect' but supports team and member sub-pages. Can be linked to an event via event_id.
+- 'event' → 'Event' in the dashboard. Ticketed events with registration. Pairs with the campaign-ticket tools.
+- 'general' → NOT shown in the dashboard creation chooser. Represents the account's primary donation page (singleton — only one per account, accessible at givebutter.com/[account-slug]). Attempting to create a second one returns 422: 'You can only have one general donations campaign.'
+
+If creating campaigns programmatically and unsure, 'collect' is the right default for most use cases.`;
+
 server.tool(
   "create_campaign",
-  "Create a new campaign",
+  "Create a new campaign. Note: cover images cannot be set via the public API — they must be uploaded through the Givebutter dashboard after creation.",
   {
-    title: z.string().describe("Campaign title"),
-    type: z.enum(["standard", "event", "sweepstakes", "p2p"]).describe("Campaign type - affects pricing tier"),
-    goal: z.number().optional().describe("Fundraising goal in cents"),
-    description: z.string().optional().describe("Campaign description"),
+    title: z.string().max(150).describe("Campaign title"),
+    type: z.enum(["general", "collect", "fundraise", "event"]).describe(campaignTypeDescription),
+    subtitle: z.string().max(255).optional().describe("Campaign subtitle"),
+    campaign_description: z.string().optional().describe("The campaign body HTML. This becomes the public donor-facing content on givebutter.com — write the actual content, not metadata or reasoning notes."),
+    website: z.string().url().max(255).optional().describe("Campaign website URL"),
+    slug: z.string().max(255).optional().describe("Custom URL slug. Note: Givebutter may append the auto-generated campaign code as a suffix if the slug conflicts with an existing campaign (observed empirically; not in the official docs)."),
+    goal: z.number().int().min(0).optional().describe("Fundraising goal in whole dollars (e.g. 1200 for a $1,200 goal — the API does NOT use cents). Set to 0 to clear the goal; Givebutter stores 0 as null."),
     end_at: z.string().optional().describe("End date in ISO 8601 format"),
+    beneficiary_id: z.number().int().optional().describe("Beneficiary account ID"),
+    timezone: z.string().max(255).optional().describe("Campaign timezone (e.g., America/New_York)"),
+    currency: z.string().optional().describe("Currency code. USD is the only currently-supported value as of 2026-04-30; loosened to a string to avoid breaking if Givebutter expands."),
+    settings: campaignSettingsSchema,
   },
-  async ({ title, type, goal, description, end_at }) => {
-    const body: Record<string, unknown> = { title, type };
-    if (goal !== undefined) body.goal = goal;
-    if (description !== undefined) body.description = description;
-    if (end_at !== undefined) body.end_at = end_at;
-
+  async ({ title, type, subtitle, campaign_description, website, slug, goal, end_at, beneficiary_id, timezone, currency, settings }) => {
+    const body = buildBody({ title, type, subtitle, description: campaign_description, website, slug, goal, end_at, beneficiary_id, timezone, currency, settings });
     const result = await apiRequest("/campaigns", "POST", body);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
@@ -137,24 +157,32 @@ server.tool(
 
 server.tool(
   "update_campaign",
-  "Update an existing campaign",
+  "Update an existing campaign. Partial updates supported — only supply the fields you want to change. (The endpoint is documented as PUT but Givebutter applies it as a partial update; omitted fields are preserved.) Note: cover images cannot be set via the public API — they must be uploaded through the Givebutter dashboard.",
   {
     campaign_id: z.number().describe("The campaign ID"),
-    title: z.string().optional().describe("Campaign title"),
-    goal: z.number().optional().describe("Fundraising goal in cents"),
-    description: z.string().optional().describe("Campaign description"),
+    title: z.string().max(150).optional().describe("Campaign title"),
+    type: z.enum(["general", "collect", "fundraise", "event"]).optional().describe(campaignTypeDescription),
+    subtitle: z.string().max(255).optional().describe("Campaign subtitle"),
+    campaign_description: z.string().optional().describe("The campaign body HTML. This becomes the public donor-facing content on givebutter.com — write the actual content, not metadata or reasoning notes."),
+    website: z.string().url().max(255).optional().describe("Campaign website URL"),
+    slug: z.string().max(255).optional().describe("Custom URL slug. Note: Givebutter may append the auto-generated campaign code as a suffix if the slug conflicts with an existing campaign (observed empirically; not in the official docs)."),
+    goal: z.number().int().min(0).optional().describe("Fundraising goal in whole dollars (e.g. 1200 for a $1,200 goal — the API does NOT use cents). Set to 0 to clear the goal; Givebutter stores 0 as null."),
     end_at: z.string().optional().describe("End date in ISO 8601 format"),
+    beneficiary_id: z.number().int().optional().describe("Beneficiary account ID"),
+    timezone: z.string().max(255).optional().describe("Campaign timezone"),
+    currency: z.string().optional().describe("Currency code. USD is the only currently-supported value as of 2026-04-30; loosened to a string to avoid breaking if Givebutter expands."),
+    settings: campaignSettingsSchema,
   },
-  async ({ campaign_id, title, goal, description, end_at }) => {
-    const body = buildBody({ title, goal, description, end_at });
-    const result = await apiRequest(`/campaigns/${campaign_id}`, "PATCH", body);
+  async ({ campaign_id, title, type, subtitle, campaign_description, website, slug, goal, end_at, beneficiary_id, timezone, currency, settings }) => {
+    const body = buildBody({ title, type, subtitle, description: campaign_description, website, slug, goal, end_at, beneficiary_id, timezone, currency, settings });
+    const result = await apiRequest(`/campaigns/${campaign_id}`, "PUT", body);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
 server.tool(
   "delete_campaign",
-  "Delete a campaign",
+  "Delete a campaign. Constraints: (1) the API key must own the campaign — campaigns from sub-accounts, beneficiaries, or chapters return 404 even if visible elsewhere; (2) campaigns that have raised money cannot be deleted (the API returns 409 'This campaign has already raised money, and can not be deleted.'). A 404 typically means scope/permission, not a wrapper bug.",
   {
     campaign_id: z.number().describe("The campaign ID to delete"),
   },
@@ -248,7 +276,7 @@ server.tool(
 
 server.tool(
   "delete_contact",
-  "Archive a contact (soft delete)",
+  "Archive a contact (soft delete — recoverable via restore_contact). A 404 typically means the contact is not in this API key's scope, not a wrapper bug.",
   {
     contact_id: z.number().describe("The contact ID to archive"),
   },
@@ -272,20 +300,18 @@ server.tool(
 
 // ============ CONTACT ACTIVITIES ============
 
+// Source: docs.givebutter.com/api-reference/contact-activities/create-a-contact-activity (verified 2026-04-30)
+const contactActivityTypeEnum = z.enum([
+  "email", "meeting", "note", "phone_call", "sms",
+  "completed_task", "volunteer_activity",
+]);
+
 server.tool(
   "list_contact_activities",
   "List all activities for a contact",
   {
     contact_id: z.number().describe("The contact ID"),
-    type: z.enum([
-      "archived", "campaign.joined", "email", "email.subscribed", "email.unsubscribed",
-      "letter", "meeting", "note", "phone_call", "recurring_plan.canceled",
-      "recurring_plan.created", "recurring_plan.activated", "signup_form.submitted",
-      "sms", "sms.subscribed", "sms.unsubscribed", "subscription_form.submitted",
-      "completed_task", "ticket.issued", "transaction.recieved", "transaction.succeeded",
-      "transaction.acknowledged", "transaction.unacknowledged", "unarchived",
-      "volunteer_activity", "soft_credited"
-    ]).optional().describe("Filter by activity type"),
+    type: contactActivityTypeEnum.optional().describe("Filter by activity type"),
   },
   async ({ contact_id, type }) => {
     const result = await apiRequest(`/contacts/${contact_id}/activities`, "GET", undefined, { type });
@@ -307,8 +333,45 @@ server.tool(
 );
 
 server.tool(
+  "create_contact_activity",
+  "Log a new activity for a contact (note, meeting, call, etc.)",
+  {
+    contact_id: z.number().describe("The contact ID"),
+    type: contactActivityTypeEnum.describe("Activity type"),
+    note: z.string().max(255).optional().describe("Activity note (max 255 chars)"),
+    subject: z.string().max(255).optional().describe("Activity subject (max 255 chars)"),
+    occurred_at: z.string().optional().describe("When the activity occurred, ISO 8601"),
+    timezone: z.string().max(255).optional().describe("Timezone for occurred_at"),
+  },
+  async ({ contact_id, ...fields }) => {
+    const body = buildBody(fields);
+    const result = await apiRequest(`/contacts/${contact_id}/activities`, "POST", body);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "update_contact_activity",
+  "Update an existing contact activity",
+  {
+    contact_id: z.number().describe("The contact ID"),
+    activity_id: z.number().describe("The activity ID"),
+    type: contactActivityTypeEnum.optional().describe("Activity type"),
+    note: z.string().max(255).optional().describe("Activity note (max 255 chars)"),
+    subject: z.string().max(255).optional().describe("Activity subject (max 255 chars)"),
+    occurred_at: z.string().optional().describe("When the activity occurred, ISO 8601"),
+    timezone: z.string().max(255).optional().describe("Timezone for occurred_at"),
+  },
+  async ({ contact_id, activity_id, ...fields }) => {
+    const body = buildBody(fields);
+    const result = await apiRequest(`/contacts/${contact_id}/activities/${activity_id}`, "PATCH", body);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
   "delete_contact_activity",
-  "Delete a contact activity",
+  "Delete a contact activity. A 404 typically means scope/permission, not a wrapper bug. May return 422 with field-level errors for validation failures.",
   {
     contact_id: z.number().describe("The contact ID"),
     activity_id: z.number().describe("The activity ID to delete"),
@@ -362,19 +425,49 @@ server.tool(
 
 // ============ TRANSACTIONS ============
 
+// Source: docs.givebutter.com/api-reference/transactions/create-a-transaction (verified 2026-04-30)
+const paymentMethodEnum = z.enum([
+  "ach", "card", "cash", "check", "digital_wallet", "donor_advised_fund",
+  "paypal", "venmo", "cashapp", "terminal", "stock", "in-kind",
+  "property", "other", "none",
+]);
+
+const dedicationTypeEnum = z.enum(["in_memory_of", "in_honor_of"]);
+
+const dedicationObjectSchema = z.object({
+  type: dedicationTypeEnum,
+  name: z.string().max(255),
+  recipient_name: z.string().max(255).nullable().optional(),
+  recipient_email: z.string().email().nullable().optional(),
+});
+
 server.tool(
   "list_transactions",
-  "List all transactions",
+  "List all transactions with optional filters, sort, and pagination.",
   {
-    page: z.number().optional().describe("Page number for pagination"),
-    campaign_id: z.number().optional().describe("Filter by campaign ID"),
-    contact_id: z.number().optional().describe("Filter by contact ID"),
+    page: z.number().optional().describe("Page number (1-indexed)"),
+    per_page: z.number().int().min(1).max(100).optional().describe("Items per page (default 20, max 100)"),
+    campaign_id: z.number().optional().describe("Filter by campaign ID (undocumented but historically supported)"),
+    contact_id: z.number().optional().describe("Filter by contact ID (undocumented but historically supported)"),
+    transactedAfter: z.string().optional().describe("Only transactions transacted at or after this ISO 8601 datetime"),
+    transactedBefore: z.string().optional().describe("Only transactions transacted at or before this ISO 8601 datetime"),
+    createdAfter: z.string().optional().describe("Only transactions created at or after this ISO 8601 datetime"),
+    createdBefore: z.string().optional().describe("Only transactions created at or before this ISO 8601 datetime"),
+    updatedAfter: z.string().optional().describe("Only transactions updated at or after this ISO 8601 datetime"),
+    updatedBefore: z.string().optional().describe("Only transactions updated at or before this ISO 8601 datetime"),
+    checkDepositedAfter: z.string().optional().describe("Only transactions with check_deposited_at at or after this ISO 8601 datetime"),
+    checkDepositedBefore: z.string().optional().describe("Only transactions with check_deposited_at at or before this ISO 8601 datetime"),
+    method: paymentMethodEnum.optional().describe("Filter by payment method"),
+    scope: z.enum(["all", "benefiting", "chapters"]).optional().describe("Transaction scope: all, benefiting, chapters"),
+    sortBy: z.enum(["amount", "transacted_at", "created_at", "contact_name"]).optional().describe("Sort field (ascending)"),
+    sortByDesc: z.enum(["amount", "transacted_at", "created_at", "contact_name"]).optional().describe("Sort field (descending)"),
+    contacts: z.string().optional().describe("Comma-separated list of contact IDs to filter by"),
   },
-  async ({ page, campaign_id, contact_id }) => {
+  async (args) => {
     const result = await apiRequest("/transactions", "GET", undefined, {
-      page,
-      campaign_id: campaign_id?.toString(),
-      contact_id: contact_id?.toString()
+      ...args,
+      campaign_id: args.campaign_id?.toString(),
+      contact_id: args.contact_id?.toString(),
     });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
@@ -393,6 +486,59 @@ server.tool(
 );
 
 server.tool(
+  "create_transaction",
+  "Create a manual/offline transaction",
+  {
+    method: paymentMethodEnum.describe("Payment method"),
+    transacted_at: z.string().describe("Transaction date in ISO 8601 format"),
+    amount: z.string().describe("Transaction amount as a decimal string (e.g. '25.00')"),
+    campaign_code: z.string().optional().describe("Campaign code to associate the transaction with"),
+    campaign_title: z.string().max(255).optional().describe("Campaign title (creates a campaign if code not found)"),
+    campaign_team_id: z.number().int().optional().describe("Campaign team ID"),
+    team_member_id: z.number().int().optional().describe("Team member ID"),
+    contact_id: z.number().int().optional().describe("Contact ID"),
+    contact_external_id: z.string().max(255).optional().describe("External contact ID"),
+    fund_code: z.string().max(255).optional().describe("Fund code"),
+    mark_deposited: z.boolean().optional().describe("Mark transaction as deposited"),
+    timezone: z.string().optional().describe("Timezone for the transaction"),
+    acknowledged_at: z.string().optional().describe("Acknowledgement date in ISO 8601 format"),
+    external_label: z.string().max(255).optional().describe("External label"),
+    external_id: z.string().max(255).optional().describe("External ID"),
+    contact_contact_since: z.string().optional().describe("Contact-since date in ISO 8601 format"),
+    fee_covered: z.string().optional().describe("Fee covered amount as decimal string"),
+    platform_fee: z.string().optional().describe("Platform fee as decimal string"),
+    processing_fee: z.string().optional().describe("Processing fee as decimal string"),
+    check_number: z.string().max(255).optional().describe("Check number"),
+    check_deposited_at: z.string().optional().describe("Check deposited date in ISO 8601 format"),
+    company: z.string().max(255).optional().describe("Donor company"),
+    internal_note: z.string().max(255).optional().describe("Internal note"),
+    first_name: z.string().max(255).optional().describe("Donor first name"),
+    last_name: z.string().max(255).optional().describe("Donor last name"),
+    email: z.string().max(255).optional().describe("Donor email"),
+    phone: z.string().optional().describe("Donor phone"),
+    address_1: z.string().max(255).optional().describe("Address line 1"),
+    address_2: z.string().max(255).optional().describe("Address line 2"),
+    city: z.string().max(255).optional().describe("City"),
+    state: z.string().max(255).optional().describe("State"),
+    zipcode: z.string().max(255).optional().describe("Zip / postal code"),
+    country: z.string().optional().describe("Country"),
+    dedication_type: dedicationTypeEnum.optional().describe("Dedication type"),
+    dedication_name: z.string().max(255).optional().describe("Dedication name"),
+    dedication_recipient_name: z.string().max(255).optional().describe("Dedication recipient name"),
+    dedication_recipient_email: z.string().optional().describe("Dedication recipient email"),
+    giving_space_message: z.string().max(65535).optional().describe("Giving space message"),
+    appeal_code: z.string().max(255).optional().describe("Appeal code"),
+    appeal_name: z.string().max(255).optional().describe("Appeal name"),
+    appeal_status: z.string().optional().describe("Appeal status"),
+  },
+  async (fields) => {
+    const body = buildBody(fields);
+    const result = await apiRequest("/transactions", "POST", body);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
   "update_transaction",
   "Update an existing transaction",
   {
@@ -404,9 +550,12 @@ server.tool(
     campaign_member_id: z.string().optional().describe("Campaign member ID"),
     fund_id: z.string().optional().describe("Fund ID"),
     campaign_id: z.string().optional().describe("Campaign ID"),
-    method: z.string().optional().describe("Payment method"),
-    transacted_at: z.string().optional().describe("Transaction date"),
+    method: paymentMethodEnum.optional().describe("Payment method"),
+    transacted_at: z.string().optional().describe("Transaction date in ISO 8601 format"),
     appeal_id: z.string().optional().describe("Appeal ID"),
+    offline_payment_received: z.string().optional().describe("Offline payment received"),
+    custom_fields: z.array(z.string()).optional().describe("Custom field values"),
+    dedication: dedicationObjectSchema.optional().describe("Dedication object — all four fields required if supplied"),
   },
   async ({ transaction_id, ...fields }) => {
     const body = buildBody(fields);
@@ -445,7 +594,7 @@ server.tool(
 
 server.tool(
   "delete_campaign_member",
-  "Remove a member from a campaign",
+  "Remove a member from a campaign. A 404 typically means the campaign or member is not in this API key's scope, not a wrapper bug.",
   {
     campaign_id: z.number().describe("The campaign ID"),
     member_id: z.number().describe("The member ID to remove"),
@@ -486,7 +635,7 @@ server.tool(
 
 server.tool(
   "delete_campaign_team",
-  "Delete a team from a campaign",
+  "Delete a team from a campaign. A 404 typically means the campaign or team is not in this API key's scope, not a wrapper bug.",
   {
     campaign_id: z.number().describe("The campaign ID"),
     team_id: z.number().describe("The team ID to delete"),
@@ -619,7 +768,7 @@ server.tool(
 
 server.tool(
   "delete_discount_code",
-  "Delete a discount code (cannot delete codes already used - deactivate instead)",
+  "Delete a discount code. Constraints: (1) the API returns 422 'Cannot delete a discount code that has been used. Please update its status to inactive.' if the code has been used — call update_discount_code with active:false instead; (2) a 404 typically means scope/permission, not a wrapper bug.",
   {
     campaign_id: z.number().describe("The campaign ID"),
     discount_code_id: z.number().describe("The discount code ID to delete"),
@@ -691,7 +840,7 @@ server.tool(
 
 server.tool(
   "delete_household",
-  "Delete a household",
+  "Delete a household. A 404 typically means the household is not in this API key's scope, not a wrapper bug.",
   {
     household_id: z.number().describe("The household ID to delete"),
   },
@@ -744,7 +893,7 @@ server.tool(
 
 server.tool(
   "remove_household_contact",
-  "Remove a contact from a household",
+  "Remove a contact from a household. Returns the updated household with its remaining contacts. A 404 typically means scope/permission, not a wrapper bug.",
   {
     household_id: z.number().describe("The household ID"),
     contact_id: z.number().describe("The contact ID to remove"),
@@ -857,7 +1006,7 @@ server.tool(
 
 server.tool(
   "delete_webhook",
-  "Delete a webhook",
+  "Delete a webhook. A 404 typically means the webhook is not in this API key's scope, not a wrapper bug.",
   {
     webhook_id: z.string().describe("The webhook ID to delete"),
   },
@@ -1068,7 +1217,7 @@ server.tool(
 
 server.tool(
   "delete_fund",
-  "Delete a fund/designation",
+  "Delete a fund/designation. A 404 typically means the fund is not in this API key's scope, not a wrapper bug.",
   {
     fund_id: z.string().describe("The fund ID to delete"),
   },
